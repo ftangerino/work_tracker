@@ -1,5 +1,3 @@
-from __future__ import annotations
-from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional, Dict
 
@@ -14,11 +12,11 @@ def dt_to_str(dt: datetime) -> str:
 def str_to_dt(s: str) -> datetime:
     return datetime.strptime(s, ISO).replace(tzinfo=timezone.utc)
 
-@dataclass
 class WorkSession:
-    id: str
-    started_at: datetime
-    ended_at: Optional[datetime] = None
+    def __init__(self, id: str, started_at: datetime, ended_at: Optional[datetime] = None):
+        self.id = id
+        self.started_at = started_at
+        self.ended_at = ended_at
 
     def end(self) -> None:
         if not self.ended_at:
@@ -34,10 +32,11 @@ class WorkSession:
         return int((end - self.started_at).total_seconds())
 
     def to_dict(self) -> Dict:
-        d = asdict(self)
-        d["started_at"] = dt_to_str(self.started_at)
-        d["ended_at"] = dt_to_str(self.ended_at) if self.ended_at else None
-        return d
+        return {
+            "id": self.id,
+            "started_at": dt_to_str(self.started_at),
+            "ended_at": dt_to_str(self.ended_at) if self.ended_at else None,
+        }
 
     @staticmethod
     def from_dict(d: Dict) -> "WorkSession":

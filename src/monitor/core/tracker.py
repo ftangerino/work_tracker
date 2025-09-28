@@ -1,17 +1,15 @@
-from __future__ import annotations
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta, date
-from typing import List, Dict, Optional
+from datetime import datetime, date
+from typing import List, Optional
 import uuid
 
 from .session import WorkSession, now_utc
 from ..io.storage import StorageJSON
 
-@dataclass
 class Status:
-    active: bool
-    started_at: Optional[datetime]
-    elapsed_seconds: int
+    def __init__(self, active: bool, started_at: Optional[datetime], elapsed_seconds: int):
+        self.active = active
+        self.started_at = started_at
+        self.elapsed_seconds = elapsed_seconds
 
 class TimeTracker:
     def __init__(self, storage: StorageJSON):
@@ -19,10 +17,9 @@ class TimeTracker:
 
     def start(self) -> str:
         state = self.storage.load()
-        # encerra eventual sessão aberta “zumbi”
+        # encerra sessão zumbi, se existir
         for s in state["sessions"]:
             if s["ended_at"] is None:
-                # mantém apenas uma sessão ativa por vez
                 WorkSession.from_dict(s).end()
         ws = WorkSession(id=str(uuid.uuid4()), started_at=now_utc())
         state["sessions"].append(ws.to_dict())
@@ -58,7 +55,7 @@ class TimeTracker:
         return out
 
     def totals_between(self, start: date, end: date) -> int:
-        """segundos trabalhados no intervalo [start, end] por data UTC"""
+        """Retorna total de segundos entre start e end (inclusive)."""
         sec = 0
         state = self.storage.load()
         for s in state["sessions"]:
