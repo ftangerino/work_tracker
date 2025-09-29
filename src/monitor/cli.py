@@ -3,17 +3,17 @@ from __future__ import annotations
 import argparse
 import os
 import time
-import sys
 from datetime import datetime, timezone, timedelta, date
 
 from .io.storage import StorageJSON
 from .core.tracker import TimeTracker
 from .io.report import ReportService
-from .core.policy import HydrationPolicy, BreakPolicy  # construtores em SEGUNDOS
+from .core.policy import HydrationPolicy, BreakPolicy, StandPolicy  # <- StandPolicy
 
 # ---------- intervalos (SEGUNDOS) ----------
-HYDRATION_SECONDS = 5     # aviso visual 💧
-BREAK_SECONDS     = 10    # pausa com ENTER (desconta do efetivo)
+HYDRATION_SECONDS = 5     # aviso visual 💧 (base TOTAL)
+BREAK_SECONDS     = 10    # pausa com ENTER (base EFETIVO)
+STAND_SECONDS     = 8     # aviso "de pé" (base TOTAL)
 
 def today_utc() -> date:
     return datetime.now(tz=timezone.utc).date()
@@ -23,25 +23,20 @@ IS_WINDOWS = (os.name == "nt")
 # -------- helpers para pausa interativa --------
 def _wait_enter_with_updates(render_fn, interval: float = 0.5) -> int:
     """
-    Espera ENTER atualizando a tela via render_fn().
-    Retorna a duração da pausa em segundos (inteiros).
-    - Windows: usa msvcrt (não bloqueia)
-    - Outros: fallback para input() (sem atualização)
+    Espera ENTER atualizando a tela via render_fn(). Retorna duração da pausa (s).
+    - Windows: não bloqueia (msvcrt), tela atualiza.
+    - Outros: fallback input() (tela estática).
     """
     t0 = time.time()
     if IS_WINDOWS:
         try:
             import msvcrt
         except ImportError:
-            # raro, mas se acontecer: fallback
             render_fn()
             input("")
             return int(time.time() - t0)
-
-        # loop até ENTER
         while True:
             render_fn()
-            # verifica tecla
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()
                 if ch == "\r" or ch == "\n":
@@ -49,7 +44,6 @@ def _wait_enter_with_updates(render_fn, interval: float = 0.5) -> int:
             time.sleep(interval)
         return int(time.time() - t0)
     else:
-        # fallback: sem atualização (stdin bloqueante)
         render_fn()
         input("")
         return int(time.time() - t0)
@@ -57,38 +51,39 @@ def _wait_enter_with_updates(render_fn, interval: float = 0.5) -> int:
 def _print_pause_screen(effective_hms: str, total_hms: str) -> None:
     os.system("cls" if os.name == "nt" else "clear")
     print("🔴 PAUSA CURTA")
-    print(f"Efetivo (antes da pausa): {effective_hms}")
-    print(f"Total   (agora):          {total_hms}")
+    print(f"Efetivo (congelado):     {effective_hms}")
+    print(f"Total   (correndo):      {total_hms}")
     print("")
     print("Quando terminar a pausa, pressione ENTER para voltar ao trabalho…")
 
-# --------- WATCH SIMPLES (Total x Efetivo, pausa, hidratação) ----------
+# --------- WATCH SIMPLES (Total x Efetivo, pausa, hidratação, de pé) ----------
 def watch_simple(tracker: TimeTracker, interval: float = 1.0) -> None:
     """
     - Mostra 'Total' (bruto) e 'Efetivo' (descontando pausas confirmadas).
-    - Pausa: ao cruzar múltiplo de BREAK_SECONDS, entra em pausa; ENTER para voltar.
-      (não re-gatilha outra pausa enquanto estiver pausado)
-    - Hidratação: alerta 💧 ~60s; não altera tempos.
+    - Hidratação: aviso 💧 por ~60s (base TOTAL).
+    - De pé: aviso visual por ~60s (base TOTAL).
+    - Pausa: gatilho baseado no EFETIVO (não avança durante pausa).
     """
     paused_accum_seconds = 0               # desconta do EFETIVO
     hydrate_flash_until: float = 0.0
+    stand_flash_until: float = 0.0
     last_hydration_cycle: int = -1
+    last_stand_cycle: int = -1
     last_break_cycle: int = -1
-    in_break_pause = False                 # guarda se estamos em pausa agora
+    in_break_pause = False
 
     hydration = HydrationPolicy(HYDRATION_SECONDS)
     breakpol  = BreakPolicy(BREAK_SECONDS)
+    standpol  = StandPolicy(STAND_SECONDS)
+
+    # placeholders capturados por closure no render da pausa
+    effective_hms_before = "00:00:00"
 
     def render_pause():
-        """Renderiza a tela de pausa mantendo o TOTAL correndo e EFETIVO congelado."""
+        """Renderiza a tela de pausa: TOTAL atualiza, EFETIVO congelado."""
         st_local = tracker.status()
-        raw_elapsed_local = st_local.elapsed_seconds
-        # durante a pausa, o efetivo não cresce: desconta também o tempo corrente de pausa
-        # (calculado por diferença de t0 lá no _wait_enter_with_updates)
-        total_hms = TimeTracker.humanize_seconds(raw_elapsed_local)
-        # efetivo mostrado é o de antes da pausa; a string já vem pronta por arg,
-        # mas para atualizar visualmente sem drift, mantemos a mesma (não recalculamos aqui)
-        _print_pause_screen(effective_hms_before, total_hms)
+        total_hms_local = TimeTracker.humanize_seconds(st_local.elapsed_seconds)  # TOTAL corre
+        _print_pause_screen(effective_hms_before, total_hms_local)
 
     try:
         while True:
@@ -96,50 +91,47 @@ def watch_simple(tracker: TimeTracker, interval: float = 1.0) -> None:
             st = tracker.status()
 
             if st.active:
-                raw_elapsed = st.elapsed_seconds                 # TOTAL (bruto)
-                effective_elapsed = max(0, raw_elapsed - paused_accum_seconds)
+                # tempos
+                raw_elapsed = st.elapsed_seconds                          # TOTAL
+                effective_elapsed = max(0, raw_elapsed - paused_accum_seconds)  # EFETIVO
                 total_hms = TimeTracker.humanize_seconds(raw_elapsed)
                 effective_hms = TimeTracker.humanize_seconds(effective_elapsed)
 
-                # ciclos atuais (base TOTAL)
+                # ----- ciclos -----
+                # HIDRATAÇÃO & DE PÉ: base TOTAL (avisos visuais)
                 hyd_cycle = int(raw_elapsed // hydration.interval) if hydration.interval > 0 else 0
-                brk_cycle = int(raw_elapsed // breakpol.interval)  if breakpol.interval  > 0 else 0
-
-                # hidratação: aciona 💧 ao entrar num novo ciclo
                 if hyd_cycle > last_hydration_cycle and raw_elapsed > 0:
                     hydrate_flash_until = time.time() + 60
                     last_hydration_cycle = hyd_cycle
 
-                # pausa: só dispara se NÃO estiver pausado
-                if (not in_break_pause) and (brk_cycle > last_break_cycle) and raw_elapsed > 0 and breakpol.interval > 0:
-                    # entra em pausa
+                stand_cycle = int(raw_elapsed // standpol.interval) if standpol.interval > 0 else 0
+                if stand_cycle > last_stand_cycle and raw_elapsed > 0:
+                    stand_flash_until = time.time() + 60
+                    last_stand_cycle = stand_cycle
+
+                # PAUSA: base EFETIVO (não avança durante pausa)
+                brk_cycle = int(effective_elapsed // breakpol.interval) if breakpol.interval > 0 else 0
+                if (not in_break_pause) and (brk_cycle > last_break_cycle) and (effective_elapsed > 0) and breakpol.interval > 0:
                     in_break_pause = True
-                    # congela EFETIVO (salva string bonita)
                     effective_hms_before = effective_hms
-
-                    # aguarda ENTER com tela atualizando (Windows) ou estática (outros)
-                    pause_secs = _wait_enter_with_updates(
-                        render_fn=lambda: render_pause(),
-                        interval=interval
-                    )
-                    # soma pausa ao acumulado (desconta do EFETIVO)
+                    pause_secs = _wait_enter_with_updates(render_fn=render_pause, interval=interval)
                     paused_accum_seconds += pause_secs
-
-                    # ao sair da pausa:
-                    # - marca que já processou o ciclo atual (evita re-gatilho imediato)
-                    # - libera novo disparo apenas a partir do próximo ciclo completo
                     st_after = tracker.status()
                     raw_after = st_after.elapsed_seconds
-                    last_break_cycle = int(raw_after // breakpol.interval)
+                    effective_after = max(0, raw_after - paused_accum_seconds)
+                    last_break_cycle = int(effective_after // breakpol.interval)
                     in_break_pause = False
-                    # volta ao loop para redesenhar
 
-                # próximos lembretes (contagem regressiva, base TOTAL)
+                # contagens regressivas (Hidratação/De pé: TOTAL; Pausa: EFETIVO)
                 hyd_rem = hydration.interval - int(raw_elapsed % hydration.interval) if hydration.interval else 0
-                brk_rem = breakpol.interval  - int(raw_elapsed % breakpol.interval)   if breakpol.interval  else 0
+                std_rem = standpol.interval   - int(raw_elapsed % standpol.interval) if standpol.interval  else 0
+                brk_rem = breakpol.interval   - int(effective_elapsed % breakpol.interval) if breakpol.interval else 0
+
                 hints = []
                 if hydration.interval:
                     hints.append(f"hidratação em {TimeTracker.humanize_seconds(hyd_rem)}")
+                if standpol.interval:
+                    hints.append(f"de pé em {TimeTracker.humanize_seconds(std_rem)}")
                 if breakpol.interval:
                     hints.append(f"pausa em {TimeTracker.humanize_seconds(brk_rem)}")
                 hints_str = " | ".join(hints) if hints else "—"
@@ -150,6 +142,7 @@ def watch_simple(tracker: TimeTracker, interval: float = 1.0) -> None:
                 print(f"Total:     {total_hms}")
                 print(f"Efetivo:   {effective_hms}  (desconta pausas)")
                 print(f"Hidratação: {'💧 agora' if time.time() < hydrate_flash_until else '—'}")
+                print(f"De pé:     {'AGORA' if time.time() < stand_flash_until else '—'}")
                 print(f"Próximos:  {hints_str}")
                 print("\nENTER para finalizar pausas quando solicitado • Ctrl+C para sair")
 
@@ -176,9 +169,12 @@ def watch_fullscreen(tracker: TimeTracker, interval: float = 1.0) -> None:
         curses.curs_set(0)
         stdscr.nodelay(True)
         hydrate_flash_until = 0.0
+        stand_flash_until = 0.0
         last_hydration_cycle = -1
+        last_stand_cycle = -1
 
         hydration = HydrationPolicy(HYDRATION_SECONDS)
+        standpol  = StandPolicy(STAND_SECONDS)
 
         while True:
             stdscr.erase()
@@ -196,13 +192,20 @@ def watch_fullscreen(tracker: TimeTracker, interval: float = 1.0) -> None:
                     hydrate_flash_until = time.time() + 60
                     last_hydration_cycle = hyd_cycle
 
+                stand_cycle = int(raw_elapsed // standpol.interval) if standpol.interval > 0 else 0
+                if stand_cycle > last_stand_cycle and raw_elapsed > 0:
+                    stand_flash_until = time.time() + 60
+                    last_stand_cycle = stand_cycle
+
                 hyd_rem = hydration.interval - int(raw_elapsed % hydration.interval) if hydration.interval else 0
+                std_rem = standpol.interval   - int(raw_elapsed % standpol.interval) if standpol.interval  else 0
 
                 lines = [
                     f"Status:     🟢 SESSÃO ATIVA",
                     f"Início:     {st.started_at.isoformat()}",
                     f"Total:      {total_hms}",
                     f"Hidratação: {'💧 agora' if time.time() < hydrate_flash_until else f'em {TimeTracker.humanize_seconds(hyd_rem)}'}",
+                    f"De pé:      {'AGORA' if time.time() < stand_flash_until else f'em {TimeTracker.humanize_seconds(std_rem)}'}",
                     "Obs.: pausas com ENTER disponíveis no modo simples (sem curses)",
                 ]
             else:
@@ -241,7 +244,7 @@ def main():
     p_export.add_argument("path", help="caminho do arquivo CSV a gerar")
     p_export.add_argument("--days", type=int, default=7, help="quantidade de dias (padrão: 7)")
 
-    p_watch = sub.add_parser("watch", help="painel ao vivo (Total x Efetivo, pausa, hidratação)")
+    p_watch = sub.add_parser("watch", help="painel ao vivo (Total x Efetivo, pausa, hidratação, de pé)")
     p_watch.add_argument("--interval", type=float, default=1.0, help="intervalo de atualização em segundos")
     p_watch.add_argument("--fullscreen", action="store_true", help="usa curses (tela fixa)")
 

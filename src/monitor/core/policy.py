@@ -9,18 +9,22 @@ class Policy(ABC):
 
 class HydrationPolicy(Policy):
     def __init__(self, interval_seconds: int = 3600):
-        self.interval = interval_seconds
+        self.interval = max(1, int(interval_seconds))
     def next_hint_seconds(self, active_seconds: int) -> Optional[int]:
-        return self.interval - (active_seconds % self.interval)
+        a = int(active_seconds)
+        return self.interval - (a % self.interval)
 
 class BreakPolicy(Policy):
     def __init__(self, interval_seconds: int = 3000):
-        self.interval = interval_seconds
+        self.interval = max(1, int(interval_seconds))
     def next_hint_seconds(self, active_seconds: int) -> Optional[int]:
-        return self.interval - (active_seconds % self.interval)
+        a = int(active_seconds)
+        return self.interval - (a % self.interval)
 
-
-class MealPolicy(Policy):
-    """Stub: futura regra para janela de refeição; por enquanto, não recomenda."""
+class StandPolicy(Policy):
+    """Lembrete para ficar de pé/esticar as pernas em intervalos regulares."""
+    def __init__(self, interval_seconds: int = 2700):  # 45 min por padrão
+        self.interval = max(1, int(interval_seconds))
     def next_hint_seconds(self, active_seconds: int) -> Optional[int]:
-        return None
+        a = int(active_seconds)
+        return self.interval - (a % self.interval)
