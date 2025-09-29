@@ -1,123 +1,168 @@
-# src/monitor/api.py
+###################################################################################################
+# 📥 IMPORTS | CODING: UTF-8
+###################################################################################################
 from __future__ import annotations
-from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.middleware.cors import CORSMiddleware
+
 from datetime import datetime, timezone, timedelta
 from io import StringIO
 import csv
 
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+
 from .io.storage import StorageJSON
 from .core.tracker import TimeTracker
 from .io.report import ReportService
-from .core.policy import HydrationPolicy, BreakPolicy, StandPolicy  # intervalos em SEGUNDOS
+from .core.policy import HydrationPolicy, BreakPolicy, StandPolicy  # lembretes em SEGUNDOS
 
-# ---------- intervals (ajuste como quiser; segundos) ----------
-HYDRATION_SECONDS = 3600   # 60 min
-BREAK_SECONDS     = 3000   # 50 min
-STAND_SECONDS     = 2700   # 45 min
+###################################################################################################
+# ⏱️ POLICIES – INTERVALOS PADRÃO (segundos)
+# Em produção, ajuste para:
+#   hidratação: 3600 (60 min), pausa: 3000 (50 min), de pé: 2700 (45 min)
+###################################################################################################
+HYDRATION_INTERVAL_SECONDS = 3600
+BREAK_INTERVAL_SECONDS     = 3000
+STAND_INTERVAL_SECONDS     = 2700
 
-def today_utc():
+###################################################################################################
+# 🗓️ HELPERS
+###################################################################################################
+def current_utc_date():
+    """Retorna a data atual em UTC (sem timezone)."""
     return datetime.now(tz=timezone.utc).date()
 
+def compute_next_hints(elapsed_total_seconds: int) -> dict:
+    """
+    Calcula em quantos segundos virão os próximos lembretes.
+    (Nesta API, todos baseados no tempo TOTAL.)
+    """
+    hydration = HydrationPolicy(HYDRATION_INTERVAL_SECONDS)
+    pause     = BreakPolicy(BREAK_INTERVAL_SECONDS)
+    stand     = StandPolicy(STAND_INTERVAL_SECONDS)
+
+    def remaining(interval_seconds: int) -> int:
+        if interval_seconds <= 0:
+            return 0
+        elapsed = int(elapsed_total_seconds)
+        return interval_seconds - (elapsed % interval_seconds)
+
+    return {
+        "hydration_in_seconds": remaining(hydration.interval_seconds),
+        "break_in_seconds":     remaining(pause.interval_seconds),
+        "stand_in_seconds":     remaining(stand.interval_seconds),
+    }
+
+###################################################################################################
+# 💾 SINGLETONS (STATEFUL SERVICES)
+###################################################################################################
 storage = StorageJSON()
 tracker = TimeTracker(storage)
 reports = ReportService(tracker)
 
+###################################################################################################
+# 🌐 FASTAPI APP
+###################################################################################################
 app = FastAPI(title="Work Tracker API", version="0.0.1")
 
-# CORS para permitir dev local do front (ajuste origins depois)
+# CORS liberado para desenvolvimento local (RESTRINGIR em produção!)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # em prod: restrinja!
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def _next_hints(elapsed_total_seconds: int):
-    """Calcula próximos lembretes (baseados no total para hidratação/de pé; no total aqui)."""
-    hyd = HydrationPolicy(HYDRATION_SECONDS)
-    brk = BreakPolicy(BREAK_SECONDS)
-    std = StandPolicy(STAND_SECONDS)
-
-    def remain(interval: int) -> int:
-        if interval <= 0:
-            return 0
-        return interval - (int(elapsed_total_seconds) % interval)
-
-    return {
-        "hydration_in_seconds": remain(hyd.interval),
-        "break_in_seconds":     remain(brk.interval),
-        "stand_in_seconds":     remain(std.interval),
-    }
-
+###################################################################################################
+# 🔌 ENDPOINTS
+###################################################################################################
 @app.post("/sessions/start")
 def start_session():
-    sid = tracker.start()
-    return {"ok": True, "session_id": sid}
+    """Inicia uma nova sessão de trabalho."""
+    session_id = tracker.start()
+    return {"ok": True, "session_id": session_id}
 
 @app.post("/sessions/stop")
 def stop_session():
-    sid = tracker.stop()
-    if not sid:
+    """Encerra a sessão ativa mais recente (se houver)."""
+    session_id = tracker.stop()
+    if not session_id:
         raise HTTPException(status_code=409, detail="Nenhuma sessão ativa para encerrar.")
-    return {"ok": True, "session_id": sid}
+    return {"ok": True, "session_id": session_id}
 
 @app.get("/status")
 def get_status():
-    st = tracker.status()
-    if not st.active:
+    """
+    Retorna o status atual:
+      - active: bool
+      - started_at: ISO-8601 ou None
+      - elapsed_seconds / elapsed_hms (TOTAL)
+      - next_hints: tempos restantes para hidratação/pausa/ficar de pé
+    """
+    status = tracker.status()
+    if not status.active:
         return {
             "active": False,
             "started_at": None,
             "elapsed_seconds": 0,
             "elapsed_hms": TimeTracker.humanize_seconds(0),
-            "next_hints": _next_hints(0),
+            "next_hints": compute_next_hints(0),
         }
+
+    elapsed_total = status.elapsed_seconds
     return {
         "active": True,
-        "started_at": st.started_at.isoformat(),
-        "elapsed_seconds": st.elapsed_seconds,  # total bruto
-        "elapsed_hms": TimeTracker.humanize_seconds(st.elapsed_seconds),
-        "next_hints": _next_hints(st.elapsed_seconds),
+        "started_at": status.started_at.isoformat(),
+        "elapsed_seconds": elapsed_total,
+        "elapsed_hms": TimeTracker.humanize_seconds(elapsed_total),
+        "next_hints": compute_next_hints(elapsed_total),
     }
 
 @app.get("/report")
 def get_report(scope: str = Query("today", enum=["today", "week"])):
+    """
+    Retorna um resumo:
+      - scope=today  -> { date, sessions, total_seconds, total_hms }
+      - scope=week   -> { start, end, total_seconds, total_hms }
+    """
     if scope == "today":
-        dsum = reports.daily_summary(today_utc())
+        summary = reports.daily_summary(current_utc_date())
         return {
             "scope": "today",
-            "date": dsum["date"],
-            "sessions": dsum["sessions"],
-            "total_seconds": dsum["total_seconds"],
-            "total_hms": dsum["total_hms"],
+            "date": summary["date"],
+            "sessions": summary["sessions"],
+            "total_seconds": summary["total_seconds"],
+            "total_hms": summary["total_hms"],
         }
-    else:
-        wsum = reports.week_summary(today_utc())
-        return {
-            "scope": "week",
-            "start": wsum["start"],
-            "end": wsum["end"],
-            "total_seconds": wsum["total_seconds"],
-            "total_hms": wsum["total_hms"],
-        }
+
+    week = reports.week_summary(current_utc_date())
+    return {
+        "scope": "week",
+        "start": week["start"],
+        "end": week["end"],
+        "total_seconds": week["total_seconds"],
+        "total_hms": week["total_hms"],
+    }
 
 @app.get("/export")
 def export_csv(days: int = Query(7, ge=1, le=31)):
-    # gera CSV em memória e devolve como attachment
-    end = today_utc()
+    """
+    Exporta CSV com consolidação diária dos últimos N dias.
+    Colunas: date, sessions, total_hms, total_seconds.
+    """
+    end_day = current_utc_date()
     rows = []
-    for i in range(days):
-        d = end - timedelta(days=(days - 1 - i))
-        dsum = reports.daily_summary(d)
-        rows.append([dsum["date"], dsum["sessions"], dsum["total_hms"], dsum["total_seconds"]])
+    for index in range(days):
+        day = end_day - timedelta(days=(days - 1 - index))
+        daily = reports.daily_summary(day)
+        rows.append([daily["date"], daily["sessions"], daily["total_hms"], daily["total_seconds"]])
 
-    sio = StringIO()
-    w = csv.writer(sio)
-    w.writerow(["date", "sessions", "total_hms", "total_seconds"])
-    w.writerows(rows)
-    csv_bytes = sio.getvalue().encode("utf-8")
+    # Gera CSV em memória
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["date", "sessions", "total_hms", "total_seconds"])
+    writer.writerows(rows)
+    csv_bytes = buffer.getvalue().encode("utf-8")
 
     headers = {
         "Content-Disposition": f'attachment; filename="report_last_{days}_days.csv"'

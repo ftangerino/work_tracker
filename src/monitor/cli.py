@@ -1,5 +1,8 @@
-# src/monitor/cli.py
+###################################################################################################
+# 📥 IMPORTS | CODING: UTF-8
+###################################################################################################
 from __future__ import annotations
+
 import argparse
 import os
 import time
@@ -8,142 +11,191 @@ from datetime import datetime, timezone, timedelta, date
 from .io.storage import StorageJSON
 from .core.tracker import TimeTracker
 from .io.report import ReportService
-from .core.policy import HydrationPolicy, BreakPolicy, StandPolicy  # <- StandPolicy
+from .core.policy import HydrationPolicy, BreakPolicy, StandPolicy
 
-# ---------- intervalos (SEGUNDOS) ----------
-HYDRATION_SECONDS = 5     # aviso visual 💧 (base TOTAL)
-BREAK_SECONDS     = 10    # pausa com ENTER (base EFETIVO)
-STAND_SECONDS     = 8     # aviso "de pé" (base TOTAL)
-
-def today_utc() -> date:
-    return datetime.now(tz=timezone.utc).date()
+###################################################################################################
+# ⏱️ INTERVALOS (SEGUNDOS)
+# Para demo: valores pequenos. Em prod: (ex.: 3600/3000/2700).
+###################################################################################################
+HYDRATION_INTERVAL_SECONDS = 5     # 💧 aviso (base TOTAL)
+BREAK_INTERVAL_SECONDS     = 10    # pausa com ENTER (base EFETIVO)
+STAND_INTERVAL_SECONDS     = 8     # "de pé" (base TOTAL)
 
 IS_WINDOWS = (os.name == "nt")
 
-# -------- helpers para pausa interativa --------
-def _wait_enter_with_updates(render_fn, interval: float = 0.5) -> int:
+###################################################################################################
+# 🗓️ HELPERS
+###################################################################################################
+def today_utc() -> date:
+    """Data atual em UTC (date sem tz)."""
+    return datetime.now(tz=timezone.utc).date()
+
+###################################################################################################
+# ⌨️ ENTRADA DE PAUSA (com atualização de tela)
+###################################################################################################
+def _wait_enter_with_updates(render_screen, refresh_interval: float = 0.5) -> int:
     """
-    Espera ENTER atualizando a tela via render_fn(). Retorna duração da pausa (s).
-    - Windows: não bloqueia (msvcrt), tela atualiza.
-    - Outros: fallback input() (tela estática).
+    ENTER atualizando a tela via render_screen().
+    Retorna a duração da pausa (segundos inteiros).
+
+    - Windows: usa msvcrt (não bloqueia), atualiza a tela durante a pausa.
+    - Outros: fallback para input() (tela estática durante a pausa).
     """
-    t0 = time.time()
+    start_ts = time.time()
+
     if IS_WINDOWS:
         try:
-            import msvcrt
+            import msvcrt  # type: ignore
         except ImportError:
-            render_fn()
+            render_screen()
             input("")
-            return int(time.time() - t0)
+            return int(time.time() - start_ts)
+
         while True:
-            render_fn()
+            render_screen()
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()
-                if ch == "\r" or ch == "\n":
+                if ch in ("\r", "\n"):
                     break
-            time.sleep(interval)
-        return int(time.time() - t0)
-    else:
-        render_fn()
-        input("")
-        return int(time.time() - t0)
+            time.sleep(refresh_interval)
+        return int(time.time() - start_ts)
+
+    # Fallback Unix-like: bloqueia enquanto espera ENTER
+    render_screen()
+    input("")
+    return int(time.time() - start_ts)
 
 def _print_pause_screen(effective_hms: str, total_hms: str) -> None:
-    os.system("cls" if os.name == "nt" else "clear")
+    """Tela de pausa minimalista (efetivo congelado, total correndo)."""
+    os.system("cls" if IS_WINDOWS else "clear")
     print("🔴 PAUSA CURTA")
-    print(f"Efetivo (congelado):     {effective_hms}")
-    print(f"Total   (correndo):      {total_hms}")
-    print("")
-    print("Quando terminar a pausa, pressione ENTER para voltar ao trabalho…")
+    print(f"Efetivo (congelado): {effective_hms}")
+    print(f"Total   (correndo):  {total_hms}")
+    print("\nQuando terminar a pausa, pressione ENTER para voltar ao trabalho…")
 
-# --------- WATCH SIMPLES (Total x Efetivo, pausa, hidratação, de pé) ----------
-def watch_simple(tracker: TimeTracker, interval: float = 1.0) -> None:
+###################################################################################################
+# 👀 WATCH (painel ao vivo)
+###################################################################################################
+def watch_simple(tracker: TimeTracker, refresh_interval: float = 1.0) -> None:
     """
-    - Mostra 'Total' (bruto) e 'Efetivo' (descontando pausas confirmadas).
-    - Hidratação: aviso 💧 por ~60s (base TOTAL).
-    - De pé: aviso visual por ~60s (base TOTAL).
-    - Pausa: gatilho baseado no EFETIVO (não avança durante pausa).
+    Painel ao vivo sem spam de logs:
+      - Mostra Tempo Total (bruto) e Tempo Efetivo (descontando pausas confirmadas).
+      - Hidratação e "De pé": alertas visuais ~60s, baseados no tempo TOTAL.
+      - Pausa: gatilho baseado no tempo EFETIVO (não avança enquanto pausado).
     """
-    paused_accum_seconds = 0               # desconta do EFETIVO
-    hydrate_flash_until: float = 0.0
-    stand_flash_until: float = 0.0
+    # Acumulador de segundos de pausa (desconta do EFETIVO)
+    paused_total_seconds = 0
+
+    # Estado de alertas visuais (expiram por tempo)
+    hydration_flash_until_ts: float = 0.0
+    stand_flash_until_ts: float = 0.0
+
+    # Controle de ciclos para evitar retriggers
     last_hydration_cycle: int = -1
     last_stand_cycle: int = -1
     last_break_cycle: int = -1
-    in_break_pause = False
+    in_break_pause: bool = False
 
-    hydration = HydrationPolicy(HYDRATION_SECONDS)
-    breakpol  = BreakPolicy(BREAK_SECONDS)
-    standpol  = StandPolicy(STAND_SECONDS)
+    hydration_policy = HydrationPolicy(HYDRATION_INTERVAL_SECONDS)
+    break_policy = BreakPolicy(BREAK_INTERVAL_SECONDS)
+    stand_policy = StandPolicy(STAND_INTERVAL_SECONDS)
 
-    # placeholders capturados por closure no render da pausa
-    effective_hms_before = "00:00:00"
+    # Valor textual do efetivo congelado durante a pausa (para a tela)
+    effective_hms_before_pause = "00:00:00"
 
-    def render_pause():
-        """Renderiza a tela de pausa: TOTAL atualiza, EFETIVO congelado."""
-        st_local = tracker.status()
-        total_hms_local = TimeTracker.humanize_seconds(st_local.elapsed_seconds)  # TOTAL corre
-        _print_pause_screen(effective_hms_before, total_hms_local)
+    def render_pause_screen():
+        """Atualiza a tela de pausa com Total correndo e Efetivo congelado."""
+        current_status = tracker.status()
+        total_hms_now = TimeTracker.humanize_seconds(current_status.elapsed_seconds)
+        _print_pause_screen(effective_hms_before_pause, total_hms_now)
 
     try:
         while True:
-            os.system("cls" if os.name == "nt" else "clear")
-            st = tracker.status()
+            os.system("cls" if IS_WINDOWS else "clear")
+            status = tracker.status()
 
-            if st.active:
-                # tempos
-                raw_elapsed = st.elapsed_seconds                          # TOTAL
-                effective_elapsed = max(0, raw_elapsed - paused_accum_seconds)  # EFETIVO
-                total_hms = TimeTracker.humanize_seconds(raw_elapsed)
-                effective_hms = TimeTracker.humanize_seconds(effective_elapsed)
+            if status.active:
+                # --- tempos
+                elapsed_total_seconds = status.elapsed_seconds
+                elapsed_effective_seconds = max(0, elapsed_total_seconds - paused_total_seconds)
 
-                # ----- ciclos -----
-                # HIDRATAÇÃO & DE PÉ: base TOTAL (avisos visuais)
-                hyd_cycle = int(raw_elapsed // hydration.interval) if hydration.interval > 0 else 0
-                if hyd_cycle > last_hydration_cycle and raw_elapsed > 0:
-                    hydrate_flash_until = time.time() + 60
-                    last_hydration_cycle = hyd_cycle
+                total_hms = TimeTracker.humanize_seconds(elapsed_total_seconds)
+                effective_hms = TimeTracker.humanize_seconds(elapsed_effective_seconds)
 
-                stand_cycle = int(raw_elapsed // standpol.interval) if standpol.interval > 0 else 0
-                if stand_cycle > last_stand_cycle and raw_elapsed > 0:
-                    stand_flash_until = time.time() + 60
+                # --- ciclos (hidratação/“de pé” base TOTAL; pausa base EFETIVO)
+                hydration_cycle = (
+                    int(elapsed_total_seconds // hydration_policy.interval_seconds)
+                    if hydration_policy.interval_seconds > 0 else 0
+                )
+                if hydration_cycle > last_hydration_cycle and elapsed_total_seconds > 0:
+                    hydration_flash_until_ts = time.time() + 60
+                    last_hydration_cycle = hydration_cycle
+
+                stand_cycle = (
+                    int(elapsed_total_seconds // stand_policy.interval_seconds)
+                    if stand_policy.interval_seconds > 0 else 0
+                )
+                if stand_cycle > last_stand_cycle and elapsed_total_seconds > 0:
+                    stand_flash_until_ts = time.time() + 60
                     last_stand_cycle = stand_cycle
 
-                # PAUSA: base EFETIVO (não avança durante pausa)
-                brk_cycle = int(effective_elapsed // breakpol.interval) if breakpol.interval > 0 else 0
-                if (not in_break_pause) and (brk_cycle > last_break_cycle) and (effective_elapsed > 0) and breakpol.interval > 0:
+                break_cycle = (
+                    int(elapsed_effective_seconds // break_policy.interval_seconds)
+                    if break_policy.interval_seconds > 0 else 0
+                )
+
+                # --- entrada em pausa (somente se não estiver pausado)
+                if (not in_break_pause) and (break_cycle > last_break_cycle) \
+                   and (elapsed_effective_seconds > 0) and break_policy.interval_seconds > 0:
                     in_break_pause = True
-                    effective_hms_before = effective_hms
-                    pause_secs = _wait_enter_with_updates(render_fn=render_pause, interval=interval)
-                    paused_accum_seconds += pause_secs
-                    st_after = tracker.status()
-                    raw_after = st_after.elapsed_seconds
-                    effective_after = max(0, raw_after - paused_accum_seconds)
-                    last_break_cycle = int(effective_after // breakpol.interval)
+                    effective_hms_before_pause = effective_hms
+
+                    pause_duration_seconds = _wait_enter_with_updates(
+                        render_screen=render_pause_screen,
+                        refresh_interval=refresh_interval,
+                    )
+                    paused_total_seconds += pause_duration_seconds
+
+                    # Atualiza ciclo de pausa com base no EFETIVO pós-pausa
+                    status_after = tracker.status()
+                    effective_after = max(0, status_after.elapsed_seconds - paused_total_seconds)
+                    last_break_cycle = int(effective_after // break_policy.interval_seconds)
                     in_break_pause = False
 
-                # contagens regressivas (Hidratação/De pé: TOTAL; Pausa: EFETIVO)
-                hyd_rem = hydration.interval - int(raw_elapsed % hydration.interval) if hydration.interval else 0
-                std_rem = standpol.interval   - int(raw_elapsed % standpol.interval) if standpol.interval  else 0
-                brk_rem = breakpol.interval   - int(effective_elapsed % breakpol.interval) if breakpol.interval else 0
+                # --- contagens regressivas
+                hydration_remaining = (
+                    hydration_policy.interval_seconds
+                    - int(elapsed_total_seconds % hydration_policy.interval_seconds)
+                    if hydration_policy.interval_seconds else 0
+                )
+                stand_remaining = (
+                    stand_policy.interval_seconds
+                    - int(elapsed_total_seconds % stand_policy.interval_seconds)
+                    if stand_policy.interval_seconds else 0
+                )
+                break_remaining = (
+                    break_policy.interval_seconds
+                    - int(elapsed_effective_seconds % break_policy.interval_seconds)
+                    if break_policy.interval_seconds else 0
+                )
 
-                hints = []
-                if hydration.interval:
-                    hints.append(f"hidratação em {TimeTracker.humanize_seconds(hyd_rem)}")
-                if standpol.interval:
-                    hints.append(f"de pé em {TimeTracker.humanize_seconds(std_rem)}")
-                if breakpol.interval:
-                    hints.append(f"pausa em {TimeTracker.humanize_seconds(brk_rem)}")
-                hints_str = " | ".join(hints) if hints else "—"
+                next_hints = []
+                if hydration_policy.interval_seconds:
+                    next_hints.append(f"hidratação em {TimeTracker.humanize_seconds(hydration_remaining)}")
+                if stand_policy.interval_seconds:
+                    next_hints.append(f"de pé em {TimeTracker.humanize_seconds(stand_remaining)}")
+                if break_policy.interval_seconds:
+                    next_hints.append(f"pausa em {TimeTracker.humanize_seconds(break_remaining)}")
+                next_hints_str = " | ".join(next_hints) if next_hints else "—"
 
-                # render normal
+                # --- render principal
                 print("🟢 sessão ativa")
-                print(f"Início:    {st.started_at.isoformat()}")
+                print(f"Início:    {status.started_at.isoformat()}")
                 print(f"Total:     {total_hms}")
                 print(f"Efetivo:   {effective_hms}  (desconta pausas)")
-                print(f"Hidratação: {'💧 agora' if time.time() < hydrate_flash_until else '—'}")
-                print(f"De pé:     {'AGORA' if time.time() < stand_flash_until else '—'}")
-                print(f"Próximos:  {hints_str}")
+                print(f"Hidratação: {'💧 agora' if time.time() < hydration_flash_until_ts else '—'}")
+                print(f"De pé:     {'AGORA' if time.time() < stand_flash_until_ts else '—'}")
+                print(f"Próximos:  {next_hints_str}")
                 print("\nENTER para finalizar pausas quando solicitado • Ctrl+C para sair")
 
             else:
@@ -151,102 +203,114 @@ def watch_simple(tracker: TimeTracker, interval: float = 1.0) -> None:
                 print("use: monitor start")
                 print("\nCtrl+C para sair")
 
-            time.sleep(interval)
+            time.sleep(refresh_interval)
 
     except KeyboardInterrupt:
         print("\n🔴 saindo do modo watch...")
 
-# --------- WATCH FULLSCREEN (opcional; sem pausa interativa) ----------
-def watch_fullscreen(tracker: TimeTracker, interval: float = 1.0) -> None:
-    """Tela fixa com curses (Windows: pip install windows-curses). Pausa interativa só no modo simples."""
+###################################################################################################
+# 🖥️ WATCH FULLSCREEN (curses) — sem pausa interativa
+###################################################################################################
+def watch_fullscreen(tracker: TimeTracker, refresh_interval: float = 1.0) -> None:
+    """
+    Tela fixa com curses (Windows: `pip install windows-curses`).
+    A pausa interativa (ENTER) está disponível apenas no modo simples.
+    """
     try:
-        import curses
+        import curses  # type: ignore
     except ImportError:
         print("⚠ 'curses' não disponível. No Windows, rode: pip install windows-curses")
-        return watch_simple(tracker, interval)
+        return watch_simple(tracker, refresh_interval)
 
-    def run(stdscr):
+    def _run(stdscr):
         curses.curs_set(0)
         stdscr.nodelay(True)
-        hydrate_flash_until = 0.0
-        stand_flash_until = 0.0
+
+        hydration_flash_until_ts = 0.0
+        stand_flash_until_ts = 0.0
         last_hydration_cycle = -1
         last_stand_cycle = -1
 
-        hydration = HydrationPolicy(HYDRATION_SECONDS)
-        standpol  = StandPolicy(STAND_SECONDS)
+        hydration_policy = HydrationPolicy(HYDRATION_INTERVAL_SECONDS)
+        stand_policy = StandPolicy(STAND_INTERVAL_SECONDS)
 
         while True:
             stdscr.erase()
-            h, w = stdscr.getmaxyx()
+            height, width = stdscr.getmaxyx()
             title = " Monitor de Horas – WATCH (Ctrl+C para sair) "
-            stdscr.addstr(0, max(0, (w - len(title)) // 2), title, curses.A_REVERSE)
+            stdscr.addstr(0, max(0, (width - len(title)) // 2), title, curses.A_REVERSE)
 
-            st = tracker.status()
-            if st.active:
-                raw_elapsed = st.elapsed_seconds
-                total_hms = TimeTracker.humanize_seconds(raw_elapsed)
+            status = tracker.status()
+            if status.active:
+                elapsed_total_seconds = status.elapsed_seconds
+                total_hms = TimeTracker.humanize_seconds(elapsed_total_seconds)
 
-                hyd_cycle = int(raw_elapsed // hydration.interval) if hydration.interval > 0 else 0
-                if hyd_cycle > last_hydration_cycle and raw_elapsed > 0:
-                    hydrate_flash_until = time.time() + 60
-                    last_hydration_cycle = hyd_cycle
+                hydration_cycle = int(elapsed_total_seconds // hydration_policy.interval_seconds)
+                if hydration_cycle > last_hydration_cycle and elapsed_total_seconds > 0:
+                    hydration_flash_until_ts = time.time() + 60
+                    last_hydration_cycle = hydration_cycle
 
-                stand_cycle = int(raw_elapsed // standpol.interval) if standpol.interval > 0 else 0
-                if stand_cycle > last_stand_cycle and raw_elapsed > 0:
-                    stand_flash_until = time.time() + 60
+                stand_cycle = int(elapsed_total_seconds // stand_policy.interval_seconds)
+                if stand_cycle > last_stand_cycle and elapsed_total_seconds > 0:
+                    stand_flash_until_ts = time.time() + 60
                     last_stand_cycle = stand_cycle
 
-                hyd_rem = hydration.interval - int(raw_elapsed % hydration.interval) if hydration.interval else 0
-                std_rem = standpol.interval   - int(raw_elapsed % standpol.interval) if standpol.interval  else 0
+                hydration_remaining = hydration_policy.interval_seconds - int(
+                    elapsed_total_seconds % hydration_policy.interval_seconds
+                )
+                stand_remaining = stand_policy.interval_seconds - int(
+                    elapsed_total_seconds % stand_policy.interval_seconds
+                )
 
                 lines = [
-                    f"Status:     🟢 SESSÃO ATIVA",
-                    f"Início:     {st.started_at.isoformat()}",
+                    "Status:     🟢 SESSÃO ATIVA",
+                    f"Início:     {status.started_at.isoformat()}",
                     f"Total:      {total_hms}",
-                    f"Hidratação: {'💧 agora' if time.time() < hydrate_flash_until else f'em {TimeTracker.humanize_seconds(hyd_rem)}'}",
-                    f"De pé:      {'AGORA' if time.time() < stand_flash_until else f'em {TimeTracker.humanize_seconds(std_rem)}'}",
+                    f"Hidratação: {'💧 agora' if time.time() < hydration_flash_until_ts else f'em {TimeTracker.humanize_seconds(hydration_remaining)}'}",
+                    f"De pé:      {'AGORA' if time.time() < stand_flash_until_ts else f'em {TimeTracker.humanize_seconds(stand_remaining)}'}",
                     "Obs.: pausas com ENTER disponíveis no modo simples (sem curses)",
                 ]
             else:
                 lines = [
-                    f"Status:     🔴 SEM SESSÃO ATIVA",
+                    "Status:     🔴 SEM SESSÃO ATIVA",
                     "Comando:    monitor start",
                 ]
 
-            for i, ln in enumerate(lines, start=2):
-                if i < h:
-                    stdscr.addstr(i, 2, ln)
+            for i, line in enumerate(lines, start=2):
+                if i < height:
+                    stdscr.addstr(i, 2, line)
 
             stdscr.refresh()
-            time.sleep(interval)
+            time.sleep(refresh_interval)
 
     try:
-        import curses
-        curses.wrapper(run)
+        import curses  # type: ignore
+        curses.wrapper(_run)
     except KeyboardInterrupt:
         print("\n🔴 saindo do modo fullscreen...")
 
-# ---------------------- CLI ------------------------------
+###################################################################################################
+# 🧰 CLI
+###################################################################################################
 def main():
     parser = argparse.ArgumentParser(prog="monitor", description="Monitor de horas (CLI)")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    subparsers = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("start", help="inicia sessão de trabalho")
-    sub.add_parser("stop", help="encerra sessão ativa")
-    sub.add_parser("status", help="mostra status atual")
+    subparsers.add_parser("start", help="inicia sessão de trabalho")
+    subparsers.add_parser("stop", help="encerra sessão ativa")
+    subparsers.add_parser("status", help="mostra status atual")
 
-    p_report = sub.add_parser("report", help="relatórios")
-    p_report.add_argument("--today", action="store_true", help="relatório do dia")
-    p_report.add_argument("--week", action="store_true", help="relatório da semana (últimos 7 dias)")
+    report_parser = subparsers.add_parser("report", help="relatórios")
+    report_parser.add_argument("--today", action="store_true", help="relatório do dia")
+    report_parser.add_argument("--week", action="store_true", help="relatório da semana (últimos 7 dias)")
 
-    p_export = sub.add_parser("export", help="exporta CSV")
-    p_export.add_argument("path", help="caminho do arquivo CSV a gerar")
-    p_export.add_argument("--days", type=int, default=7, help="quantidade de dias (padrão: 7)")
+    export_parser = subparsers.add_parser("export", help="exporta CSV")
+    export_parser.add_argument("path", help="caminho do arquivo CSV a gerar")
+    export_parser.add_argument("--days", type=int, default=7, help="quantidade de dias (padrão: 7)")
 
-    p_watch = sub.add_parser("watch", help="painel ao vivo (Total x Efetivo, pausa, hidratação, de pé)")
-    p_watch.add_argument("--interval", type=float, default=1.0, help="intervalo de atualização em segundos")
-    p_watch.add_argument("--fullscreen", action="store_true", help="usa curses (tela fixa)")
+    watch_parser = subparsers.add_parser("watch", help="painel ao vivo (Total x Efetivo, pausa, hidratação, de pé)")
+    watch_parser.add_argument("--interval", type=float, default=1.0, help="intervalo de atualização em segundos")
+    watch_parser.add_argument("--fullscreen", action="store_true", help="usa curses (tela fixa)")
 
     args = parser.parse_args()
 
@@ -255,35 +319,42 @@ def main():
     reports = ReportService(tracker)
 
     if args.cmd == "start":
-        sid = tracker.start()
-        print(f"🟢 sessão iniciada: {sid}")
+        session_id = tracker.start()
+        print(f"🟢 sessão iniciada: {session_id}")
+
     elif args.cmd == "stop":
-        sid = tracker.stop()
-        if sid:
-            print(f"🟢 sessão encerrada: {sid}")
+        session_id = tracker.stop()
+        if session_id:
+            print(f"🟢 sessão encerrada: {session_id}")
         else:
             print("🔴 nenhuma sessão ativa para encerrar")
+
     elif args.cmd == "status":
-        st = tracker.status()
-        if st.active:
-            print(f"🟢 sessão ativa desde {st.started_at.isoformat()} "
-                  f"(decorridos: {tracker.humanize_seconds(st.elapsed_seconds)})")
+        status = tracker.status()
+        if status.active:
+            print(
+                f"🟢 sessão ativa desde {status.started_at.isoformat()} "
+                f"(decorridos: {tracker.humanize_seconds(status.elapsed_seconds)})"
+            )
         else:
             print("🔴 nenhuma sessão ativa")
+
     elif args.cmd == "report":
         if args.today:
-            dsum = reports.daily_summary(today_utc())
-            print(f"📅 {dsum['date']} | sessões: {dsum['sessions']} | total: {dsum['total_hms']}")
+            summary = reports.daily_summary(today_utc())
+            print(f"📅 {summary['date']} | sessões: {summary['sessions']} | total: {summary['total_hms']}")
         elif args.week:
-            wsum = reports.week_summary(today_utc())
-            print(f"📅 semana {wsum['start']} → {wsum['end']} | total: {wsum['total_hms']}")
+            summary = reports.week_summary(today_utc())
+            print(f"📅 semana {summary['start']} → {summary['end']} | total: {summary['total_hms']}")
         else:
             print("use --today ou --week")
+
     elif args.cmd == "export":
         end = today_utc()
         days = [end - timedelta(days=i) for i in range(args.days)][::-1]
         reports.export_csv(args.path, days)
         print(f"🟢 CSV exportado em: {args.path}")
+
     elif args.cmd == "watch":
         if args.fullscreen:
             watch_fullscreen(tracker, args.interval)
