@@ -1,1 +1,3 @@
 # stdlib only (argparse, json, csv, datetime, pathlib)
+fastapi
+uvicorn
