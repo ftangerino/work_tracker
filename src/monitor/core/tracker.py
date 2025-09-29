@@ -12,15 +12,19 @@ class Status:
         self.elapsed_seconds = elapsed_seconds
 
 class TimeTracker:
+    """Rastreador de sessões com persistência em JSON."""
     def __init__(self, storage: StorageJSON):
         self.storage = storage
 
     def start(self) -> str:
         state = self.storage.load()
-        # encerra sessão zumbi, se existir
+        # encerra eventual sessão ativa anterior (evita sobreposição)
         for s in state["sessions"]:
-            if s["ended_at"] is None:
-                WorkSession.from_dict(s).end()
+            if s.get("ended_at") is None:
+                ws = WorkSession.from_dict(s)
+                ws.end()
+                s.update(ws.to_dict())
+
         ws = WorkSession(id=str(uuid.uuid4()), started_at=now_utc())
         state["sessions"].append(ws.to_dict())
         self.storage.save(state)
@@ -29,7 +33,7 @@ class TimeTracker:
     def stop(self) -> Optional[str]:
         state = self.storage.load()
         for s in reversed(state["sessions"]):
-            if s["ended_at"] is None:
+            if s.get("ended_at") is None:
                 ws = WorkSession.from_dict(s)
                 ws.end()
                 s.update(ws.to_dict())
@@ -40,7 +44,7 @@ class TimeTracker:
     def status(self) -> Status:
         state = self.storage.load()
         for s in reversed(state["sessions"]):
-            if s["ended_at"] is None:
+            if s.get("ended_at") is None:
                 ws = WorkSession.from_dict(s)
                 return Status(True, ws.started_at, ws.duration_seconds)
         return Status(False, None, 0)
@@ -55,7 +59,7 @@ class TimeTracker:
         return out
 
     def totals_between(self, start: date, end: date) -> int:
-        """Retorna total de segundos entre start e end (inclusive)."""
+        """Total de segundos trabalhados no intervalo [start, end] (datas UTC)."""
         sec = 0
         state = self.storage.load()
         for s in state["sessions"]:
